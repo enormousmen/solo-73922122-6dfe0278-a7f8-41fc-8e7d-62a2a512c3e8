@@ -8,6 +8,17 @@ JSON='content-type: application/json'
 pp() { python3 -m json.tool 2>/dev/null || cat; }
 jid() { python3 -c "import json,sys;print(json.load(sys.stdin)['job_id'])"; }
 
+# wait for a job to reach a terminal state (demo jobs are asynchronous)
+wait_job() {  # $1 = job_id
+  local id="$1" s
+  for _ in $(seq 1 60); do
+    s=$(curl -s "$BASE/jobs/$id" | python3 -c "import json,sys;print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "?")
+    case "$s" in succeeded|failed|cancelled) return 0;; esac
+    sleep 0.5
+  done
+  echo "warning: job $id did not finish in time" >&2
+}
+
 echo "=== 1) submit a 3-statement job; statements run in order, autocommitted ==="
 JOB=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{
   "statements": [
@@ -76,3 +87,35 @@ curl -s -o /dev/null -w "cancel after finish -> HTTP %{http_code}\n" \
 echo
 echo "=== 6) explicit transaction control is rejected (422) ==="
 curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["BEGIN", "SELECT 1"]}' | pp
+
+echo
+echo "=== 7) logical replication: can UPDATE/DELETE be published from the publisher? ==="
+echo "-- setup: one table with PK, one without; a plain publication, an"
+echo "-- insert-only publication, and a publication with a column list"
+SETUP=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": [
+  "DROP PUBLICATION IF EXISTS demo_pub_ok",
+  "DROP PUBLICATION IF EXISTS demo_pub_ins",
+  "DROP PUBLICATION IF EXISTS demo_pub_cols",
+  "DROP TABLE IF EXISTS public.demo_lr_ok",
+  "DROP TABLE IF EXISTS public.demo_lr_nopk",
+  "CREATE TABLE public.demo_lr_ok (id int PRIMARY KEY, v int)",
+  "CREATE TABLE public.demo_lr_nopk (a int, b int)",
+  "CREATE PUBLICATION demo_pub_ok FOR TABLE public.demo_lr_ok, public.demo_lr_nopk",
+  "CREATE PUBLICATION demo_pub_ins FOR TABLE public.demo_lr_ok WITH (publish = '"'"'insert'"'"')",
+  "CREATE PUBLICATION demo_pub_cols FOR TABLE public.demo_lr_ok (v)"
+]}' | jid)
+wait_job "$SETUP"
+echo "-- table with PK (note: demo_pub_cols omits the PK column -> blocked):"
+curl -s "$BASE/logical-replication/check/public/demo_lr_ok" | pp
+echo "-- table without PK (replica identity DEFAULT, no primary key -> blocked):"
+curl -s "$BASE/logical-replication/check/public/demo_lr_nopk" | pp
+echo "-- cleanup:"
+CLEAN=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": [
+  "DROP PUBLICATION IF EXISTS demo_pub_ok",
+  "DROP PUBLICATION IF EXISTS demo_pub_ins",
+  "DROP PUBLICATION IF EXISTS demo_pub_cols",
+  "DROP TABLE IF EXISTS public.demo_lr_ok",
+  "DROP TABLE IF EXISTS public.demo_lr_nopk"
+]}' | jid)
+wait_job "$CLEAN"
+echo done

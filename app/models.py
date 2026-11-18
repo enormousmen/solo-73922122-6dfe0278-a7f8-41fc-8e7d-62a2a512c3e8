@@ -111,3 +111,77 @@ class PoolStatus(BaseModel):
     size: int
     queue_depth: int
     connections: list[ConnectionStatus]
+
+
+# --------------------------------------------------------------------------
+# logical replication: publisher-side UPDATE/DELETE check
+# (see app/logrepl.py; GET /logical-replication/check/{schema}/{table})
+# --------------------------------------------------------------------------
+
+
+class OperationAssessment(BaseModel):
+    verdict: str = Field(
+        description="ok: the publisher can emit the operation via this "
+        "publication | blocked: the publication publishes the operation but "
+        "PostgreSQL would reject it on the publisher (see reasons) | "
+        "disabled: the publication does not publish this operation | "
+        "unknown: cannot be determined (see reasons)"
+    )
+    reasons: list[str]
+
+
+class PublicationAssessment(BaseModel):
+    publication: str
+    coverage: list[str] = Field(
+        description="how this publication covers the table: 'table' "
+        "(FOR TABLE), 'schema' (FOR TABLES IN SCHEMA) and/or 'all_tables' "
+        "(FOR ALL TABLES)"
+    )
+    publish_update: bool
+    publish_delete: bool
+    column_list: list[str] | None = Field(
+        description="per-table column list of the publication; null means "
+        "all columns are published"
+    )
+    row_filter: str | None = Field(
+        description="row filter expression of the per-table membership; "
+        "null means all rows are covered"
+    )
+    update: OperationAssessment
+    delete: OperationAssessment
+    notes: list[str]
+
+
+class ReplicaIdentityAssessment(BaseModel):
+    mode: str = Field(description="default | nothing | full | index")
+    status: str = Field(
+        description="ok: usable for UPDATE/DELETE | unusable: PostgreSQL "
+        "rejects UPDATE/DELETE on published tables | unknown: cannot be "
+        "determined (see detail)"
+    )
+    key_columns: list[str] | None = Field(
+        description="identity key columns; null means 'all columns' "
+        "(REPLICA IDENTITY FULL) or undetermined"
+    )
+    detail: str
+
+
+class LogicalReplicationCheck(BaseModel):
+    table_schema: str = Field(description="schema (namespace) of the checked table")
+    table: str
+    table_oid: int
+    replica_identity: ReplicaIdentityAssessment
+    publications: list[PublicationAssessment] = Field(
+        description="one entry per publication covering the table; each "
+        "publication is assessed independently -- a satisfied publication "
+        "never masks the shortcomings of another one"
+    )
+    notes: list[str]
+    assessment_scope: str = Field(
+        description="reminder that this is a publisher-side assessment "
+        "only; it does not verify that any subscriber received anything"
+    )
+    catalog_snapshot: str = Field(
+        description="how the catalog data was read (single REPEATABLE READ "
+        "snapshot on a dedicated connection)"
+    )

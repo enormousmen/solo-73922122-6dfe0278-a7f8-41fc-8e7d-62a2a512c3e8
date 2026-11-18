@@ -7,6 +7,10 @@ GET  /jobs                 list recent jobs
 GET  /jobs/{id}            job detail incl. per-statement results
 POST /jobs/{id}/cancel     cancel a queued/running job (202) ; 409 if finished
 GET  /pool                 state of the two pooled connections
+GET  /logical-replication/check/{schema}/{table}
+                           publisher-side check: can UPDATE/DELETE on this
+                           regular table be emitted by each covering
+                           publication (PostgreSQL 16)
 GET  /health               liveness
 GET  /docs                 Swagger UI
 """
@@ -15,15 +19,17 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
+import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
-from . import config
+from . import config, logrepl
 from .models import (
     CancelRequest,
     CancelResponse,
     JobDetail,
     JobSummary,
+    LogicalReplicationCheck,
     PoolStatus,
     SubmitRequest,
     SubmitResponse,
@@ -177,3 +183,37 @@ def cancel_job(job_id: str, req: CancelRequest | None = None):
 @app.get("/pool", response_model=PoolStatus)
 def pool_status():
     return pool.status()
+
+
+@app.get(
+    "/logical-replication/check/{schema}/{table}",
+    response_model=LogicalReplicationCheck,
+    summary="Publisher-side check: can UPDATE/DELETE on this regular table "
+    "be emitted by each covering publication (PostgreSQL 16)",
+)
+def logical_replication_check(schema: str, table: str):
+    """Assess, for every publication covering ``schema.table`` (directly,
+    via its schema, or FOR ALL TABLES), whether UPDATE and DELETE can be
+    emitted from the publisher, and why not if they cannot.
+
+    All catalog rows are read from one snapshot (a single REPEATABLE READ
+    READ ONLY transaction on a dedicated short-lived connection; the two
+    pooled diagnostic connections are not used).  On any catalog query
+    failure the request fails with 502 and no partial assessment is
+    returned.  The result is a publisher-side assessment only -- it does
+    not verify that any subscriber received or applied changes.
+    """
+    try:
+        return logrepl.check_table(schema, table)
+    except logrepl.TableNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except logrepl.UnsupportedRelation as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except (psycopg.Error, OSError) as exc:
+        # No partial conclusions: either a full assessment or an error.
+        log.exception("logical replication check failed for %s.%s", schema, table)
+        raise HTTPException(
+            status_code=502,
+            detail=f"catalog query failed; no partial assessment is "
+            f"returned: {type(exc).__name__}: {exc}",
+        )

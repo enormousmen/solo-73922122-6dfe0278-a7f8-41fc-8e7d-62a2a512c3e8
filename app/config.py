@@ -37,3 +37,10 @@ MAX_HOOK_DELAY_MS: int = int(os.environ.get("MAX_HOOK_DELAY_MS", "120000"))
 CANCEL_SEND_WAIT_S: float = float(os.environ.get("CANCEL_SEND_WAIT_S", "180"))
 
 CONNECT_TIMEOUT_S: int = int(os.environ.get("CONNECT_TIMEOUT_S", "10"))
+
+# Statement timeout (ms) for the logical-replication check's catalog
+# queries.  They run on a dedicated short-lived connection (never on the
+# two pooled diagnostic connections).
+LOGREPL_STATEMENT_TIMEOUT_MS: int = int(
+    os.environ.get("LOGREPL_STATEMENT_TIMEOUT_MS", "15000")
+)

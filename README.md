@@ -58,6 +58,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
 | GET | `/jobs/{id}` | 单详情 + 逐句结果（状态/列/行/rowcount/耗时/错误） |
 | POST | `/jobs/{id}/cancel` | 取消未结束的单（202 受理；已结束返回 409） |
 | GET | `/pool` | 两条连接的状态（idle/busy/cleaning/reconnecting、代数、清理失败数） |
+| GET | `/logical-replication/check/{schema}/{table}` | 核实该普通表的 UPDATE/DELETE 能否从发布端发出（逐发布评估） |
 | GET | `/health` | 存活检查 |
 | GET | `/docs` | Swagger UI |
 
@@ -97,6 +98,58 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 `pg_advisory_unlock_all()`。清理失败 → 关闭并淘汰该连接，原地补建新连接
 （`/pool` 可见 `generation` 与 `cleanups_failed` 递增）。
 
+## 逻辑复制发布端核查（UPDATE/DELETE 能否从发布端发出）
+
+`GET /logical-replication/check/{schema}/{table}` 面向已配置逻辑复制的
+PostgreSQL 16 **普通表**：找出所有覆盖该表的发布——单表发布（`FOR TABLE`）、
+整个 schema 发布（`FOR TABLES IN SCHEMA`）、全库发布（`FOR ALL TABLES`）——
+并对**每个发布分别**核对 UPDATE 与 DELETE 两种操作：
+
+- **操作开关**：`pubupdate` / `pubdelete` 未开启 → 该发布不会发出此操作
+  （`disabled`，DML 本身不受影响）；
+- **表的 replica identity**：`FULL`、或 `USING INDEX`（索引存在且有效）、
+  或 `DEFAULT` 且有主键才可用；否则发布端会拒绝 UPDATE/DELETE
+  （`cannot update/delete ... does not have a replica identity`）；
+- **列清单**（单表发布可带）：必须覆盖全部 replica identity 列，且与
+  `REPLICA IDENTITY FULL` 不能共存，否则发布端拒绝
+  （`Column list used by the publication does not cover the replica identity`）；
+- **行过滤**（单表发布可带）：过滤表达式只能引用 replica identity 列
+  （`FULL` 时不受限），否则发布端拒绝
+  （`Column used in the publication WHERE expression is not part of the
+  replica identity`）；行过滤有效时在 `notes` 中说明**只覆盖匹配行**。
+
+判定规则与 PostgreSQL 16 发布端自身检查（`CheckCmdReplicaIdentity`）一致，
+并已对照真实 PostgreSQL 16 验证。
+
+### 结论词汇（每个发布 × 每种操作）
+
+| verdict | 含义 |
+|---|---|
+| `ok` | 该发布可以从发布端发出此操作 |
+| `blocked` | 发布已开启此操作，但发布端会拒绝（`reasons` 给出具体阻碍：replica identity 不可用 / 列清单未覆盖身份列 / 行过滤引用非身份列） |
+| `disabled` | 发布未开启此操作（`pubupdate`/`pubdelete` 为 off），不会经此发布发出 |
+| `unknown` | 无法判定（`reasons` 给出原因，如 replica identity 索引无效） |
+
+### 语义与保证
+
+- **逐发布独立评估**：一份发布满足条件，不会掩盖另一份发布的缺项
+  （与 PostgreSQL 实际行为一致：任一覆盖该表的发布有问题，对应操作就会失败）。
+- **同一快照**：所有目录信息在**一条** `REPEATABLE READ READ ONLY` 事务内
+  读取，保证相互一致。
+- **查询失败不返回局部结论**：任何目录查询失败 → 502，不返回任何评估结果。
+- **不占用两条诊断长连接**：本端点每次请求使用独立的短连接
+  （带 `statement_timeout`，默认 15s，`LOGREPL_STATEMENT_TIMEOUT_MS` 可调），
+  与 `/jobs` 的两条长连接池完全无关。
+- **只代表发布端判断**：`assessment_scope` 字段明确说明——结果不代表任何
+  订阅端已收到或应用了变更。
+- 表不存在 → 404；不是普通表（视图、分区表、分区等）→ 422 并说明原因
+  （分区表的祖先发布与 `publish_via_partition_root` 不在本核查范围内）。
+
+```bash
+curl -s localhost:8000/logical-replication/check/public/orders | python3 -m json.tool
+```
+
+
 ## 测试钩子（可控停顿/故障注入）
 
 | 钩子 | 位置 | 作用 |
@@ -111,15 +164,23 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 ```bash
 pip install -r requirements-dev.txt
 pytest tests/test_sqlguard.py        # 纯单元测试（SQL 守卫），无需数据库
+pytest tests/test_logrepl.py         # 纯单元测试（发布端核查判定逻辑），无需数据库
 # 集成测试需要运行中的服务与数据库：
 API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
-  pytest tests/test_integration.py
+  pytest tests/test_integration.py tests/test_logical_replication.py
 ```
 
 集成测试覆盖：按序自动提交与逐句结果、行数截断、失败即停、参数校验、
 会话状态不泄漏（SET/临时表/咨询锁/预备语句，含失败单）、取消运行中/排队中的单、
 迟到取消（409 与延迟发送不误伤下一单）、慢 SQL/慢清理不阻塞另一连接、
 清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）。
+
+逻辑复制核查的集成测试（`tests/test_logical_replication.py`）覆盖：主键表/
+无主键表/`REPLICA IDENTITY FULL`/`NOTHING`/`USING INDEX`、列清单覆盖与缺失
+身份列、行过滤引用身份列与非身份列、单表/schema/全库三种覆盖方式、
+多发布独立评估（好发布不掩盖坏发布）、表不存在（404）与非普通表（422）、
+核查不占用连接池；并将每个 `blocked` 结论与真实 UPDATE/DELETE 在发布端的
+报错逐一对照（ground truth）。
 
 > 注：PostgreSQL 的语句取消依赖向后端进程投递 SIGINT。在禁止进程间信号的
 > 沙箱里，"中断正在执行的语句"无法生效（`pg_terminate_backend` 同样无效），

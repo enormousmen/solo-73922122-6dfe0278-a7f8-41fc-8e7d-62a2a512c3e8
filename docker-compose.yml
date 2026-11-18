@@ -1,6 +1,9 @@
 services:
   db:
     image: postgres:16-alpine
+    # wal_level=logical: the diagnostic use case includes logical
+    # replication (publications) on this database.
+    command: postgres -c wal_level=logical
     environment:
       POSTGRES_DB: diag
       POSTGRES_USER: postgres
